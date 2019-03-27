@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -29,6 +31,7 @@ var (
 	symlink       = flag.BoolP("symlink", "s", false, "Create symlink to original PDF")
 	lines         = flag.IntSliceP("line", "l", []int{}, "Lines to show in debug")
 	tagcvtonly    = flag.BoolP("tagonly", "n", true, "Write tags only for unmatched PDFs")
+	threads       = flag.IntP("threads", "c", 0, "Count of concurrent threads for processing files")
 
 	linemap      = make(map[int]bool)
 	newFileNames = make(map[string]bool)
@@ -73,8 +76,16 @@ func Run() {
 		for _, f := range preexistingFiles {
 			newFileNames[strings.Replace(filepath.Base(f), ".pdf", "", 1)] = true
 		}
-		var alltags = make(map[string]OutputTag)
-		index := 0
+		var alltags = make(map[string]*OutputTag)
+		var wg sync.WaitGroup
+		var mtx sync.Mutex
+		if *threads == 0 {
+			*threads = (runtime.NumCPU() + 1) / 2
+		}
+		tagChan := make(chan OutputTag, *threads)
+		for i := 0; i < *threads; i++ {
+			tagChan <- OutputTag{}
+		}
 		filepath.Walk(*dir, func(path string, info os.FileInfo, err error) error {
 			var reterr error
 			if info.IsDir() == true {
@@ -83,82 +94,27 @@ func Run() {
 			if !strings.HasSuffix(path, ".pdf") {
 				return reterr
 			}
-			var tag OutputTag
-			tag.Tags = make(map[string]bool)
+			oldTag := <-tagChan
+			var tag = OutputTag{
+				OriginalPDF: path,
+				Output:      *output,
+				WG:          &wg,
+				tagChan:     tagChan,
+				Mutex:       &mtx,
+			}
+			wg.Add(1)
+			go tag.Process()
+			oldTag.Extract(alltags)
 
-			base := filepath.Base(path)
-			textf := filepath.Join(*output,
-				strings.Replace(base, ".pdf", ".txt", 1))
-			tag.OriginalPDF = path
-			tag.ExtractedText = textf
-			// Is this a strict timestamp name?
-			words := []string{}
-			text := ""
-			isNumericName := numericName.MatchString(path)
-			pdf := filepath.Join(*output, base)
-			tag.NewPDF = pdf
-			if isNumericName || !*renameNewOnly {
-				// Get the text from the PDF file
-				start := time.Now()
-				text = processFile(path)
-				dur := time.Now().Sub(start)
-				if dur > time.Millisecond*500 {
-					fmt.Println(index, path, dur)
-				}
-				words = strings.Fields(text)
-				tag.FirstDate = findFirstDate(text)
-
-				// Look for keywords in the text
-				lctext := strings.ToLower(text)
-				for k := range keywords {
-					if strings.Contains(lctext, k) {
-						tag.Tags[k] = true
-					}
-				}
-				renameBase(&tag, text)
-			}
-			index++
-
-			if !tag.Renamed {
-				for _, w := range words {
-					if unicode.IsLetter([]rune(w)[0]) {
-						w = strings.ToLower(w)
-						c := allWords[w]
-						allWords[w] = c + 1
-					}
-				}
-			}
-			match := filepath.Base(tag.NewPDF) == filepath.Base(path)
-			// If we want to write the text file as well
-			if *writetext && (!*tagcvtonly || match) && isNumericName {
-				err = ioutil.WriteFile(tag.ExtractedText, []byte(text), os.ModePerm)
-				if err != nil {
-					log.Fatalln("writing", tag.ExtractedText, err)
-				}
-			}
-			// If we want to write symlinks to original
-			if *symlink {
-				err := os.Symlink(path, tag.NewPDF)
-				if err != nil {
-					log.Fatalln("symlink", path, tag.NewPDF, err)
-				}
-			} else {
-				// Otherwise write new PDF file
-				bytes, err := ioutil.ReadFile(path)
-				if err != nil {
-					log.Fatalln("reading", path, err)
-				}
-				err = ioutil.WriteFile(tag.NewPDF, bytes, os.ModePerm)
-				if err != nil {
-					log.Fatalln("writing", tag.NewPDF, err)
-				}
-			}
-
-			if (!*tagcvtonly || match) && isNumericName {
-				alltags[base] = tag
-			}
 			return nil
 		})
+		wg.Wait()
+		for i := 0; i < *threads; i++ {
+			oldTag := <-tagChan
+			oldTag.Extract(alltags)
+		}
+
+		fmt.Println("Writing tags.json")
 		// Create the JSON tag file
 		bytes, err := json.MarshalIndent(alltags, " ", "")
 		if err != nil {
@@ -185,6 +141,100 @@ func Run() {
 
 	}
 
+}
+
+// Extract blah
+func (tag *OutputTag) Extract(alltags map[string]*OutputTag) {
+	if tag.OriginalPDF != "" {
+		if tag.AddToAllTags {
+			alltags[filepath.Base(tag.OriginalPDF)] = tag
+		}
+		if !tag.Renamed {
+			for _, w := range tag.Words {
+				if unicode.IsLetter([]rune(w)[0]) {
+					w = strings.ToLower(w)
+					c := allWords[w]
+					allWords[w] = c + 1
+				}
+			}
+		}
+	}
+}
+
+// Process a tag
+func (tag *OutputTag) Process() {
+	defer func() {
+		tag.tagChan <- *tag
+		tag.WG.Done()
+	}()
+	var err error
+	tag.Tags = make(map[string]bool)
+	path := tag.OriginalPDF
+	base := filepath.Base(path)
+	textf := filepath.Join(tag.Output,
+		strings.Replace(base, ".pdf", ".txt", 1))
+	tag.TextFileName = textf
+	// Is this a strict timestamp name?
+	isNumericName := numericName.MatchString(path)
+	pdf := filepath.Join(*output, base)
+	tag.NewPDF = pdf
+	if isNumericName || !*renameNewOnly {
+		tag.processFileAndRename()
+		tag.renameBase()
+	}
+
+	match := filepath.Base(tag.NewPDF) == filepath.Base(path)
+	// If we want to write the text file as well
+	if *writetext && (!*tagcvtonly || match) && isNumericName {
+		err = ioutil.WriteFile(tag.TextFileName, []byte(tag.Text), os.ModePerm)
+		if err != nil {
+			log.Fatalln("writing", tag.TextFileName, err)
+		}
+	}
+
+	// If we want to write symlinks to original
+	if *symlink {
+		err := os.Symlink(path, tag.NewPDF)
+		if err != nil {
+			log.Fatalln("symlink", path, tag.NewPDF, err)
+		}
+	} else {
+		// Otherwise write new PDF file
+		bytes, err := ioutil.ReadFile(path)
+		if err != nil {
+			log.Fatalln("reading", path, err)
+		}
+		err = ioutil.WriteFile(tag.NewPDF, bytes, os.ModePerm)
+		if err != nil {
+			log.Fatalln("writing", tag.NewPDF, err)
+		}
+	}
+
+	if (!*tagcvtonly || match) && isNumericName {
+		tag.AddToAllTags = true
+	}
+
+}
+func (tag *OutputTag) processFileAndRename() {
+	// Get the text from the PDF file
+	start := time.Now()
+	path := tag.OriginalPDF
+	text := processFile(path)
+	tag.Text = text
+	dur := time.Now().Sub(start)
+	if dur > time.Millisecond*500 {
+		fmt.Println(path, dur)
+	}
+	tag.Words = strings.Fields(text)
+	tag.FirstDate = findFirstDate(text)
+
+	// Look for keywords in the text
+	lctext := strings.ToLower(text)
+	for k := range keywords {
+		if strings.Contains(lctext, k) {
+			tag.Tags[k] = true
+		}
+	}
 }
 
 func processFile(file string) string {
@@ -385,7 +435,12 @@ func init() {
 		expRE1 = append(expRE1, regexp.MustCompile(restr))
 	}
 
-	for _, v := range renameKeys {
+	for k, v := range renameKeys {
+		if len(v) == 1 {
+			vp := strings.Split(v[0], "-")
+			v = append(v, vp...)
+			renameKeys[k] = v
+		}
 		for i, name := range v {
 			if i == 0 {
 				continue
@@ -445,264 +500,35 @@ func findFirstDate(text string) string {
 
 // OutputTag does
 type OutputTag struct {
-	OriginalPDF   string
-	NewPDF        string
-	ExtractedText string
-	FirstDate     string          // If we found a date, it's here in 'Jan 2 2006' format
-	Tags          map[string]bool // What keywords were found in this file
-	Renamed       bool            // Was there renaming
+	OriginalPDF  string          // Path to original pdf file
+	Output       string          // Output path directory
+	NewPDF       string          // Name of new pdf file
+	TextFileName string          // Name of text file name
+	FirstDate    string          // If we found a date, it's here in 'Jan 2 2006' format
+	Text         string          // The text from the file
+	Tags         map[string]bool // What keywords were found in this file
+	Words        []string        // Words found
+	Renamed      bool            // Was there renaming
+	AddToAllTags bool            // Tags should be added to composite
+	WG           *sync.WaitGroup // The WaitGroup to use
+	tagChan      chan OutputTag  // Control channel
+	Mutex        *sync.Mutex     // Interlock to newfilenames
 }
 
 var keywords = make(map[string]bool)
 
 var allWords = make(map[string]int)
 
-var renameKeys = [][]string{
-	[]string{"Friends-Forest", "friends", "forest"},
-	[]string{"Vanguard-1099DIV", "valley forge", "1099-div"},
-	[]string{"McHugh-Law", "mchugh law"},
-	[]string{"1099-HC", "1099-hc"},
-	[]string{"NRWA", "nashua", "river", "watershed", "association"},
-	[]string{"NHLakes", "nh lakes"},
-	[]string{"ACLU", "american civil liberties union"},
-	[]string{"AdaFruit", "www.adafruit.com"},
-	[]string{"ChelmsfordPC-Jim", "chelmsford primary care"},
-	[]string{"CGLIC", "lincoln national"},
-	[]string{"WBUR", "membership@wbur.org"},
-	[]string{"Packing-List", "packing list"},
-	[]string{"Rindge-Yard", "scenic", "landscaping"},
-	[]string{"Rindge-Yard", "sc enic", "landscaping"},
-	[]string{"Rindge-Delinq-Tax", "rindge", "delinquent"},
-	[]string{"Family-Eyecare", "family eye care"},
-	[]string{"Nepenthe-Foothills", "foothills property"},
-	[]string{"Nepenthe-Foothills", "liverez"},
-	[]string{"Groton-Insurance", "cambridge mutual", "2493319"},
-	[]string{"Rindge-Insurance", "cambridge mutual", "2526086"},
-	[]string{"Rindge-Insurance", "chase", "durand"},
-	[]string{"Jim-LifeInsur", "administrator group"},
-	[]string{"Jim-LifeInsur", "administrator", "ieee"},
-	[]string{"Steward-Medical", "steward health care"},
-	[]string{"Steward-Medical", "steward medical"},
-	[]string{"Rindge-Water", "jaffrey", "water"},
-	[]string{"Nature-Conservancy", "nature", "conservancy"},
-	[]string{"Auto-Excise", "groton", "excise"},
-	[]string{"Rindge-Tax", "town of rindge", "tax collector"},
-	[]string{"Nepenthe-NHOA", "nhoa"},
-	[]string{"Groton-Water", "groton water department"},
-	[]string{"CGLIC", "whole life"},
-	[]string{"Rindge-Telephone", "fairpoint"},
-	[]string{"AmericanForests", "american forests"},
-	[]string{"Groton-Heating", "spadafore", "oil"},
-	[]string{"Groton-Heating", "wilson", "hvac"},
-	[]string{"NetApp", "netapp"},
-	[]string{"NVMC", "nashoba valley med"},
-	[]string{"CongShalom", "congregation shalom"},
-	[]string{"CongShalom", "congregationshalom.org"},
-	[]string{"Delicate-Yard", "willow", "landscape"},
-	[]string{"Rindge-Generator", "powers generator"},
-	[]string{"Rindge-Door", "overhead door company of concord"},
-	[]string{"Costco-Visa", "costco anywhere visa"},
-	[]string{"Cuisinart", "cuisinart"},
-	[]string{"Nepenthe-Electric", "aps", "energy", "arizona"},
-	[]string{"Nepenthe-Electric", "aps.com"},
-	[]string{"Sedona-Sewer-Past-Due", "Roadrunner", "past due", "Sedona"},
-	[]string{"Nepenthe-Water", "arizona", "water"},
-	[]string{"Sedona-Tax", "yavapai", "treasurer"},
-	[]string{"Nepenthe-Tax", "yavapai", "treasurer", "nepenthe"},
-	[]string{"Nepenthe-Tax-Refund", "yavapai", "treasurer", "refund"},
-	[]string{"Nepenthe-Notice-Value", "yavapai", "assessor", "nepenthe"},
-	[]string{"Buckboard-Notice-Value", "yavapai", "assessor", "hills"},
-	[]string{"Buckboard-HOA", "western", "hills", "property", "owner"},
-	[]string{"Groton-Tax", "town of groton", "real estate", "tax"},
-	[]string{"Groton-Water", "grotonwater"},
-	[]string{"Medical-Podiatrist", "jeffrey", "resnick"},
-	[]string{"Fios", "fios"},
-	[]string{"Auto-Service", "wiisonsservicegroton"},
-	[]string{"Rindge-Alarm", "central", "monitoring", "service"},
-	[]string{"Motion-FCU", "federal credit union"},
-	[]string{"Optum-HSA", "optum bank"},
-	[]string{"Loaves-Fishes", "loaves & fishes"},
-	[]string{"Jim-Longterm", "columbus life"},
-	[]string{"Medical-DrH", "harasimowicz"},
-	[]string{"Groton-Fuel", "heating oil"},
-	[]string{"Groton-Fuel", "eastern propane", "diesel"},
-	[]string{"Groton-Fuel", "800", "696", "0432", "diesel"},
-	[]string{"Medical-Reilly", "baptist", "hospital"},
-	[]string{"Nashoba-Radiology", "nashoba radiology"},
-	[]string{"Nashoba-Pathology", "nashoba", "valley", "pathology"},
-	[]string{"Auto-Registration", "massachusetts vehicle registration renewal"},
-	[]string{"Citizens-Bank", "citizens drive"},
-	[]string{"Citizens-Bank", "citizens bank"},
-	[]string{"Netapp-Stock", "netapp", "stock"},
-	[]string{"BofA", "bank of america"},
-	[]string{"NetApp", "network appliance"},
-	[]string{"Check", "features", "exceed industry"},
-	[]string{"Check", "do not write, stamp or sign below this line"},
-	[]string{"Rindge-Electric", "eversource"},
-	[]string{"Groton-Electric", "groton", "electric", "light"},
-	[]string{"Rindge-Pest", "pest", "services", "rindge"},
-	[]string{"Rindge-Pest", "pest", "services", "florence"},
-	[]string{"Rindge-Pest", "pest", "management", "florence"},
-	[]string{"Groton-Pest", "montachusett", "pest"},
-	[]string{"Anelons-Chiro", "terry", "anelons"},
-	[]string{"Rindge-Reassessment", "new assessment", "rindge"},
-	[]string{"Nepenthe-Insurance", "State Farm"},
-	[]string{"Buckboard-Insurance", "Shermantine"},
-	[]string{"Subaru-Loan", "subaru motors finance"},
-	[]string{"Epilepsy-Foundation", "Epilepsy", "Foundation"},
-	[]string{"Rindge-Belletetes", "Lumber Barns"},
-	[]string{"Rindge-Belletetes", "Belletetes"},
-	[]string{"Nashoba-Family-Med", "nashoba family med"},
-	[]string{"Mass-1099G", "1099-G", "Massachusetts"},
-	[]string{"Mass-DOR-Assessment", "Intent", "Assess", "Massachusetts"},
-	[]string{"Home-Depot", "More saving", "More doing"},
-	[]string{"Morgan-Stanley", "morgan", "stanley"},
-	[]string{"Home-Depot.com", "homedepot.com"},
-	[]string{"CLAPA", "contoocook lake", "preservation"},
-	[]string{"CLAPA", "contoocook lake", "assoc"},
-	[]string{"Quest-Labs", "quest diagnostics"},
-	[]string{"Auto-Repair", "wilsonservice"},
-	[]string{"Dental", "peter", "breen"},
-	[]string{"EFTPS", "EFTPS"},
-	[]string{"Sharon-ENT", "Ear", "Nose", "Throat"},
-	[]string{"Diving", "Northeast", "Scuba"},
-	[]string{"Habitat-Humanity", "habitat", "humanity"},
-	[]string{"Brown-Insurance", "brown", "pepperell"},
-	[]string{"HPHC", "harvard pilgrim"},
-	[]string{"UHC", "united", "health", "care"},
-	[]string{"Audi-Nashua", "audi", "nashua"},
-	[]string{"Auto-Insurance", "commerce", "insurance"},
-	[]string{"BIDMC-Medical", "beth", "israel", "deaconess"},
-	[]string{"BIDMC-Medical", "associated", "physicians", "bidmc"},
-	[]string{"Boundaries-Therapy", "Boundaries", "Therapy"},
-	[]string{"Boat-Insurance", "foremost", "insurance"},
-	[]string{"Myette", "myette"},
-	[]string{"Abby-Hall-Scholarship", "abby", "hall"},
-	[]string{"ETrade", "E*trade"},
-	[]string{"Village-Subaru", "village", "subaru"},
-	[]string{"Nashua-Subaru", "nashua", "subaru"},
-	[]string{"Helfman-Lasky", "helfman", "lasky"},
-	[]string{"Medical-Lab", "Emerson", "Pathology"},
-	[]string{"Audi-America", "Audi", "America"},
-	[]string{"Subaru-America", "Subaru", "America"},
-	[]string{"Vanguard", "Vanguard", "Group"},
-	[]string{"Boat-License", "boat", "renewal", "notice"},
-	[]string{"Nashoba-ED", "steward", "emergency", "physicians"},
-	[]string{"Rindge-Assoc", "woodmere association"},
-	[]string{"Rindge-Fuel", "eastern", "propane", "rindge"},
-	[]string{"Nepenthe-Gas", "unisource"},
-	[]string{"CVS-Drugs", "CVS", "pharmacy"},
-	[]string{"Buckboard-Sedona-Rentals", "buckboard", "sedona", "rentals"},
-	[]string{"Delta-Dental", "delta", "dental"},
-	[]string{"Rindge-Cable", "argent", "communications"},
-	[]string{"AMEX", "american", "express"},
-	[]string{"Goodwill", "goodwill", "industries"},
-	[]string{"Citibank-CC", "citibank", "client", "services"},
-	[]string{"Nepenthe-Telephone", "CenturyLink"},
-	[]string{"Nepenthe-Telephone", "qwest"},
-	[]string{"Circuit-City-Chase", "chase", "card", "services", "circuit", "city"},
-	[]string{"Park-West", "Park", "west"},
-	[]string{"Rindge-Electric", "PSNH"},
-	[]string{"Rindge-Construction", "LAMPS", "PLUS"},
-	[]string{"Rindge-Construction", "cushnie", "moore"},
-	[]string{"Rindge-Construction", "james", "libby", "moore"},
-	[]string{"Rindge-Construction", "selmer", "foundations"},
-	[]string{"Groton-Cable", "charter", "cable"},
-	[]string{"Eastern-Propane", "eastern", "propane"},
-	[]string{"Acton-Toyota", "Acton", "Toyota"},
-	[]string{"Nashua-Toyota", "Nashua", "Toyota"},
-	[]string{"Sharon-SIMPLE", "Vanguard", "SIMPLE", "IRA"},
-	[]string{"Sharon-SIMPLE", "Fidelity", "SIMPLE", "IRA"},
-	[]string{"Sharon-SIMPLE2", "smith", "barney", "SIMPLE", "IRA"},
-	[]string{"Sharon-Schwartz", "sharon", "richard", "schwartz"},
-	[]string{"Jim-Schwartz", "james", "richard", "schwartz"},
-	[]string{"Groton-Security", "adt", "security"},
-	[]string{"Rindge-Security", "monadnock", "security"},
-	[]string{"Rindge-Plumbing", "dupre", "plumbing"},
-	[]string{"Smith-Barney", "smith", "barney"},
-	[]string{"MVJF", "Merrimack", "Jewish", "Federation"},
-	[]string{"Fidelity-401K", "Fidelity", "netbenefits"},
-	[]string{"CongShalom-Donation", "enriched", "by", "donation"},
-	[]string{"TelDrug", "TelDrug"},
-	[]string{"Buckboard-Sewer", "Buckboard", "Sedona", "Roadrunner", "Wastewater"},
-	[]string{"Nepenthe-Sewer", "Jasmine", "Sedona", "Roadrunner", "Wastewater"},
-	[]string{"Nepenthe-Cable", "NPG", "CABLE"},
-	[]string{"Nepenthe-Cable", "suddenlink"},
-	[]string{"Reilly-ProSports", "pro", "sports", "ortho"},
-	[]string{"Asbestos-Removal", "asbestos"},
-	[]string{"UFund-Reid", "u.fund", "reid"},
-	[]string{"UFund-Riley", "u.fund", "riley"},
-	[]string{"Middlesex-Savings", "middlesex", "savings", "bank"},
-	[]string{"Fidelity", "fidelity"},
-	[]string{"Citizens'", "Climate"},
-	[]string{"Tesla", "tesla"},
-	[]string{"Consolidated-Communications", "consolidated", "communications"},
-	[]string{"Check", "colored", "security", "background"},
-	[]string{"IBM-W2", "ibm", "w-2", "earnings", "summary"},
-	[]string{"IBM-W2", "business", "machines", "w-2", "wage", "tax"},
-	[]string{"IBM-Overpayment", "ibm", "overpayment"},
-	[]string{"NetApp-W2", "netapp", "w-2", "earnings", "summary"},
-	[]string{"Clapa-Paypal", "paypal", "1099-k"},
-	[]string{"CGLIC", "lincoln", "national", "life", "insurance"},
-	[]string{"1095-C", "1095-C"},
-	[]string{"Mass-Car-Title", "department", "transportation", "title"},
-	[]string{"Yellowstone-Forever", "yellowstone", "forever"},
-	[]string{"Lowell-General", "lowell", "general", "hospital"},
-	[]string{"Staples", "staples"},
-	[]string{"WageWorks", "wageworks"},
-	[]string{"Groton-Council-Aging", "groton", "council", "aging"},
-	[]string{"AAA", "aaa", "member"},
-	[]string{"IRS", "department", "treasury", "internal", "revenue"},
-	[]string{"CB-CD", "citizens", "bank", "cd", "statement"},
-	[]string{"Anthem-Summary", "anthem", "health", "care", "summary"},
-	[]string{"Anthem-BC", "anthem", "blue", "cross"},
-	[]string{"Anthem-BCBS", "anthem", "blue", "cross", "shield"},
-	[]string{"Sedona-Elite", "sedona", "elite", "properties", "mgmt"},
-	[]string{"Hawaiian-Airlines", "hawaiian", "airlines"},
-	[]string{"National-Parks", "national", "parks", "conservation"},
-	[]string{"Tesla", "S 75D"},
-	[]string{"Car-Warranty", "autoassure"},
-	[]string{"Check", "pay", "order"},
-	[]string{"Check", "pay", "to", "check"},
-	[]string{"Check", "pay", "to", "endorse"},
-	[]string{"Check", "pay", "o r d e"},
-	[]string{"Caremark.com", "caremark.com"},
-	[]string{"Wilsons-Service", "wilson's", "service", "center"},
-	[]string{"Rindge-RE-Tax", "40 florence", "real estate", "tax"},
-	[]string{"PJLibrary", "PJ", "library"},
-	[]string{"Mass-Gun", "massachusetts", "firearms"},
-	[]string{"Charitable", "charitable", "gift"},
-	[]string{"IEEE-Membership", "IEEE", "Membership"},
-	[]string{"Sedona-Landscaping", "Harbison", "sedona"},
-	[]string{"Groton-Variance", "groton", "variance"},
-	[]string{"Audi-Recall", "audi", "safety", "recall"},
-	[]string{"IBM-401k", "ibm", "401", "account"},
-	[]string{"Parker-School", "parker", "school"},
-	[]string{"Northeast-Endoscopy", "northeast", "endoscopy"},
-	[]string{"1099-SA", "form", "1099-sa"},
-	[]string{"VVAC", "verde", "valley", "archaeology"},
-	[]string{"LGH-Cardiology", "lgh", "merrimack", "cardiology"},
-	[]string{"Redstone-Properties-Sedona", "redstone", "properties", "sedona"},
-	[]string{"FastLane", "fast lane"},
-	[]string{"CongShalom", "87 richardson"},
-	[]string{"NetApp-CIGNA", "visalia", "claim"},
-	[]string{"NetApp-CIGNA", "cigna"},
-	[]string{"Sedona-Buckboard", "western hills"},
-	[]string{"Murphy-Insurance", "dfmurphy.com"},
-	[]string{"BankofAmerica", "BankofAmerica"},
-	[]string{"Metlife-Dental", "metlife", "dental"},
-	//
-	[]string{"Tax-Deductible", "tax", "deductible"},
-}
-
-func renameBase(tag *OutputTag, text string) {
+func (tag *OutputTag) renameBase() {
 	var newbase string
+
 	convert := func(path *string) {
 		dir := filepath.Dir(*path)
 		*path = filepath.Join(dir,
 			newbase+filepath.Ext(*path))
 	}
 	if len(tag.Tags) > 0 {
+		// renamekeys is read-only
 		for _, arr := range renameKeys {
 			newbase1 := arr[0]
 			newbase = newbase1 + tag.FirstDate
@@ -713,8 +539,10 @@ func renameBase(tag *OutputTag, text string) {
 					break
 				}
 			}
+			// We are still "success" if we did not have a miss looking up the tags
 			if success {
 				// Renumber file names if necessary
+				tag.Mutex.Lock()
 				if newFileNames[newbase] == true {
 					for suffix := 1; true; suffix++ {
 						nextName := fmt.Sprintf("%s-%d", newbase, suffix)
@@ -725,20 +553,24 @@ func renameBase(tag *OutputTag, text string) {
 						break
 					}
 				}
-				convert(&tag.ExtractedText)
+				convert(&tag.TextFileName)
 				convert(&tag.NewPDF)
 				tag.Renamed = true
 				newFileNames[newbase] = true
+				tag.Mutex.Unlock()
 				break
 			}
 		}
 	} else {
-		if len(text) == 0 {
+		// If no text associated with file, sad.
+		// Prepend "notext-" to the original name
+		// Otherwise, no renaming happens
+		if len(tag.Text) == 0 {
 			base := filepath.Base(tag.OriginalPDF)
 			ext := filepath.Ext(tag.OriginalPDF)
-			base = strings.Replace(base, ext, "", 1)
-			newbase = "notext-" + base
-			convert(&tag.ExtractedText)
+			newbase = "notext-" + strings.Replace(base, ext, "", 1)
+
+			convert(&tag.TextFileName)
 			convert(&tag.NewPDF)
 		}
 	}
