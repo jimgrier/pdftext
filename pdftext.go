@@ -39,8 +39,15 @@ var (
 var preexistingFiles []string
 var numericName = regexp.MustCompile(`\d\d\d\d(_\d\d){5}.pdf$`)
 
+var start time.Time
+
+func elapsed() time.Duration {
+	return time.Now().Sub(start)
+}
+
 // Run does everything
 func Run() {
+	start = time.Now()
 	flag.Parse()
 	for _, i := range *lines {
 		linemap[i] = true
@@ -235,13 +242,16 @@ func processFile(file string) string {
 		}
 		//		fmt.Println()
 	}
-	alltext := ""
-	for _, c := range strings.Join(pages, "\n") {
+	input := strings.Join(pages, "\n")
+	alltext := make([]rune, len(input))
+	i := 0
+	for _, c := range input {
 		if utf8.RuneLen(c) == 1 && c != 0 {
-			alltext += string(c)
+			alltext[i] = c
+			i++
 		}
 	}
-	return alltext
+	return string(alltext)
 }
 
 // Given a Page, return a string containing the best guess of the white space separation for
