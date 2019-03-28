@@ -225,8 +225,42 @@ func (tag *OutputTag) processFileAndRename() {
 	if dur > time.Millisecond*500 {
 		fmt.Println(path, dur)
 	}
-	tag.Words = strings.Fields(text)
 	tag.FirstDate = findFirstDate(text)
+
+	words := strings.Fields(text)
+	for _, w := range words {
+		w = strings.ToLower(w)
+		runes := []rune(w)
+		i := len(runes) - 1
+		for ; i >= 0; i-- {
+			r := runes[i]
+			if unicode.IsDigit(r) || unicode.IsLetter(r) {
+				break
+			}
+		}
+		if i < 1 {
+			continue
+		}
+		runes = runes[:i+1]
+		firstRune := runes[0]
+		if !unicode.IsDigit(firstRune) && !unicode.IsLetter(firstRune) {
+			continue
+		}
+		tag.Words = append(tag.Words, string(runes))
+
+	}
+	seen := make(map[string]bool)
+	j := 0
+	for _, w := range tag.Words {
+		if _, ok := seen[w]; ok {
+			continue
+		}
+		seen[w] = true
+		tag.Words[j] = w
+		j++
+	}
+	tag.Words = tag.Words[:j]
+	sort.Strings(tag.Words)
 
 	// Look for keywords in the text
 	lctext := strings.ToLower(text)
